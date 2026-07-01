@@ -1,0 +1,442 @@
+# models.py
+from django.db import models
+from django.contrib.auth.models import User
+from django.utils import timezone
+
+# Категории из ТЗ
+CATEGORY_CHOICES = [
+    ('tanks', 'Танки'),
+    ('healers', 'Хилы'),
+    ('dd', 'ДД'),
+    ('traders', 'Торговцы'),
+    ('guild_masters', 'Гилдмастеры'),
+    ('quest_givers', 'Квестгиверы'),
+    ('blacksmiths', 'Кузнецы'),
+    ('tailors', 'Кожевники'),
+    ('alchemists', 'Зельевары'),
+    ('spell_masters', 'Мастера заклинаний'),
+]
+
+class Advertisement(models.Model):
+    """Модель объявления"""
+    title = models.CharField(max_length=200, verbose_name="Заголовок")
+    text = models.TextField(verbose_name="Текст объявления")
+    category = models.CharField(
+        max_length=20, 
+        choices=CATEGORY_CHOICES,
+        verbose_name="Категория"
+    )
+    author = models.ForeignKey(
+        User, 
+        on_delete=models.CASCADE,
+        related_name='advertisements'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    # Для картинок и видео (можно использовать FileField/ImageField)
+    content_media = models.TextField(
+        blank=True, 
+        verbose_name="Встроенный контент (HTML)"
+    )
+    
+    def __str__(self):
+        return self.title
+    
+    class Meta:
+        verbose_name = "Объявление"
+        verbose_name_plural = "Объявления"
+
+
+class Response(models.Model):
+    """Модель отклика на объявление"""
+    advertisement = models.ForeignKey(
+        Advertisement,
+        on_delete=models.CASCADE,
+        related_name='responses'
+    )
+    author = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='responses'
+    )
+    text = models.TextField(verbose_name="Текст отклика")
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_accepted = models.BooleanField(
+        default=False, 
+        verbose_name="Принят ли отклик"
+    )
+    
+    def __str__(self):
+        return f"Отклик от {self.author.username} на {self.advertisement.title}"
+    
+    class Meta:
+        verbose_name = "Отклик"
+        verbose_name_plural = "Отклики"
+        ordering = ['-created_at']
+
+
+class RegistrationCode(models.Model):
+    """Модель для хранения кодов подтверждения регистрации"""
+    email = models.EmailField(unique=True)
+    code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_used = models.BooleanField(default=False)
+    
+    def __str__(self):
+        return f"{self.email} - {self.code}"
+# forms.py
+from django import forms
+from django.contrib.auth.models import User
+from .models import Advertisement, Response
+
+class RegistrationForm(forms.Form):
+    email = forms.EmailField()
+    password = forms.CharField(widget=forms.PasswordInput)
+    password_confirm = forms.CharField(widget=forms.PasswordInput)
+    
+    def clean(self):
+        cleaned_data = super().clean()
+        if cleaned_data.get('password') != cleaned_data.get('password_confirm'):
+            raise forms.ValidationError("Пароли не совпадают")
+        return cleaned_data
+
+class CodeVerificationForm(forms.Form):
+    code = forms.CharField(max_length=6)
+
+# views.py
+import random
+from django.shortcuts import render, redirect
+from django.contrib.auth import login
+from django.core.mail import send_mail
+from django.conf import settings
+from django.contrib.auth.models import User
+from .forms import RegistrationForm, CodeVerificationForm
+from .models import RegistrationCode
+
+def register_request(request):
+    """Запрос на регистрацию"""
+    if request.method == 'POST':
+        form = RegistrationForm(request.POST)
+        if form.is_valid():
+            email = form.cleaned_data['email']
+            password = form.cleaned_data['password']
+            
+            # Генерация кода (6 цифр)
+            code = ''.join([str(random.randint(0, 9)) for _ in range(6)])
+            
+            # Сохранение кода в БД
+            RegistrationCode.objects.update_or_create(
+                email=email,
+                defaults={'code': code, 'is_used': False}
+            )
+            
+            # Отправка email с кодом
+            send_mail(
+                subject='Код подтверждения регистрации',
+                message=f'Ваш код подтверждения: {code}',
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[email],
+                fail_silently=False,
+            )
+            
+            # Сохранение email в сессии для следующего шага
+            request.session['registration_email'] = email
+            request.session['registration_password'] = password
+            
+            return redirect('verify_code')
+    else:
+        form = RegistrationForm()
+    
+    return render(request, 'registration/register.html', {'form': form})
+
+def verify_code(request):
+    """Проверка кода подтверждения"""
+    if request.method == 'POST':
+        form = CodeVerificationForm(request.POST)
+        if form.is_valid():
+            code = form.cleaned_data['code']
+            email = request.session.get('registration_email')
+            password = request.session.get('registration_password')
+            
+            # Проверка кода
+            reg_code = RegistrationCode.objects.filter(
+                email=email,
+                code=code,
+                is_used=False
+            ).first()
+            
+            if reg_code:
+                # Создание пользователя
+                username = email.split('@')[0]  # Простой username из email
+                user = User.objects.create_user(
+                    username=username,
+                    email=email,
+                    password=password
+                )
+                
+                # Помечаем код как использованный
+                reg_code.is_used = True
+                reg_code.save()
+                
+                # Автоматический вход
+                login(request, user)
+                
+                # Очистка сессии
+                del request.session['registration_email']
+                del request.session['registration_password']
+                
+                return redirect('home')
+            else:
+                form.add_error('code', 'Неверный код или срок действия истек')
+    else:
+        form = CodeVerificationForm()
+    
+    return render(request, 'registration/verify_code.html', {'form': form})
+# signals.py
+from django.db.models.signals import post_save, pre_save
+from django.dispatch import receiver
+from django.core.mail import send_mail
+from django.conf import settings
+from .models import Response, Advertisement
+
+@receiver(post_save, sender=Response)
+def notify_ad_author_on_response(sender, instance, created, **kwargs):
+    """
+    Отправка email автору объявления при получении отклика
+    """
+    if created:  # Только при создании нового отклика
+        author = instance.advertisement.author
+        response_author = instance.author
+        
+        send_mail(
+            subject=f'Новый отклик на ваше объявление "{instance.advertisement.title}"',
+            message=f'Пользователь {response_author.username} оставил отклик на ваше объявление.\n\n'
+                    f'Текст отклика:\n{instance.text}',
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[author.email],
+            fail_silently=False,
+        )
+
+@receiver(pre_save, sender=Response)
+def notify_user_on_response_acceptance(sender, instance, **kwargs):
+    """
+    Отправка email пользователю при принятии его отклика
+    """
+    if instance.pk:  # Если отклик уже существует (обновление)
+        try:
+            old_instance = Response.objects.get(pk=instance.pk)
+            # Если отклик только что приняли
+            if instance.is_accepted and not old_instance.is_accepted:
+                user = instance.author
+                ad_author = instance.advertisement.author
+                
+                send_mail(
+                    subject=f'Ваш отклик на объявление "{instance.advertisement.title}" принят!',
+                    message=f'Поздравляем! Пользователь {ad_author.username} принял ваш отклик.',
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[user.email],
+                    fail_silently=False,
+                )
+        except Response.DoesNotExist:
+            pass
+
+# apps.py
+from django.apps import AppConfig
+
+class ClassifiedAdsConfig(AppConfig):
+    default_auto_field = 'django.db.models.BigAutoField'
+    name = 'classified_ads'
+    
+    def ready(self):
+        import classified_ads.signals  # Импорт сигналов
+# views.py (продолжение)
+from django.shortcuts import get_object_or_404, render, redirect
+from django.contrib.auth.decorators import login_required
+from .models import Advertisement, Response
+from .forms import AdvertisementForm, ResponseForm
+
+def home(request):
+    """Главная страница - список всех объявлений"""
+    ads = Advertisement.objects.all().order_by('-created_at')
+    return render(request, 'classified_ads/home.html', {'ads': ads})
+
+@login_required
+def create_advertisement(request):
+    """Создание объявления"""
+    if request.method == 'POST':
+        form = AdvertisementForm(request.POST, request.FILES)
+        if form.is_valid():
+            ad = form.save(commit=False)
+            ad.author = request.user
+            ad.save()
+            return redirect('ad_detail', pk=ad.pk)
+    else:
+        form = AdvertisementForm()
+    return render(request, 'classified_ads/ad_form.html', {'form': form})
+
+@login_required
+def edit_advertisement(request, pk):
+    """Редактирование объявления"""
+    ad = get_object_or_404(Advertisement, pk=pk, author=request.user)
+    if request.method == 'POST':
+        form = AdvertisementForm(request.POST, request.FILES, instance=ad)
+        if form.is_valid():
+            form.save()
+            return redirect('ad_detail', pk=ad.pk)
+    else:
+        form = AdvertisementForm(instance=ad)
+    return render(request, 'classified_ads/ad_form.html', {'form': form})
+
+def ad_detail(request, pk):
+    """Детальный просмотр объявления"""
+    ad = get_object_or_404(Advertisement, pk=pk)
+    responses = ad.responses.all()
+    return render(request, 'classified_ads/ad_detail.html', {
+        'ad': ad,
+        'responses': responses
+    })
+
+@login_required
+def create_response(request, ad_pk):
+    """Создание отклика на объявление"""
+    ad = get_object_or_404(Advertisement, pk=ad_pk)
+    
+    if request.method == 'POST':
+        form = ResponseForm(request.POST)
+        if form.is_valid():
+            response = form.save(commit=False)
+            response.advertisement = ad
+            response.author = request.user
+            response.save()
+            # Email отправится автоматически через signal
+            return redirect('my_responses')
+    else:
+        form = ResponseForm()
+    
+    return render(request, 'classified_ads/response_form.html', {
+        'form': form,
+        'ad': ad
+    })
+
+@login_required
+def my_responses(request):
+    """Личная страница с откликами на объявления пользователя"""
+    # Получаем все объявления пользователя
+    user_ads = Advertisement.objects.filter(author=request.user)
+    
+    # Получаем все отклики на эти объявления
+    all_responses = Response.objects.filter(
+        advertisement__in=user_ads
+    ).select_related('advertisement', 'author')
+    
+    # Фильтрация по объявлению (если передан параметр)
+    ad_id = request.GET.get('ad_id')
+    if ad_id:
+        all_responses = all_responses.filter(advertisement_id=ad_id)
+    
+    return render(request, 'classified_ads/my_responses.html', {
+        'responses': all_responses,
+        'user_ads': user_ads
+    })
+
+@login_required
+def accept_response(request, response_pk):
+    """Принятие отклика"""
+    response = get_object_or_404(
+        Response, 
+        pk=response_pk,
+        advertisement__author=request.user
+    )
+    
+    if not response.is_accepted:
+        response.is_accepted = True
+        response.save()
+        # Email отправится автоматически через signal
+    
+    return redirect('my_responses')
+
+@login_required
+def delete_response(request, response_pk):
+    """Удаление отклика"""
+    response = get_object_or_404(
+        Response,
+        pk=response_pk,
+        advertisement__author=request.user
+    )
+    response.delete()
+    return redirect('my_responses')
+# models.py (добавить)
+class Newsletter(models.Model):
+    """Модель новостной рассылки"""
+    subject = models.CharField(max_length=200, verbose_name="Тема")
+    message = models.TextField(verbose_name="Сообщение")
+    created_at = models.DateTimeField(auto_now_add=True)
+    is_sent = models.BooleanField(default=False, verbose_name="Отправлена")
+    
+    def send(self):
+        """Отправка рассылки всем пользователям"""
+        from django.core.mail import send_mail
+        from django.contrib.auth.models import User
+        
+        users = User.objects.filter(email__isnull=False).exclude(email='')
+        recipient_list = [user.email for user in users]
+        
+        send_mail(
+            subject=self.subject,
+            message=self.message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=recipient_list,
+            fail_silently=False,
+        )
+        
+        self.is_sent = True
+        self.save()
+
+# views.py (добавить)
+@login_required
+def send_newsletter(request):
+    """Отправка новостной рассылки (только для админов)"""
+    if not request.user.is_staff:
+        return redirect('home')
+    
+    if request.method == 'POST':
+        subject = request.POST.get('subject')
+        message = request.POST.get('message')
+        
+        newsletter = Newsletter.objects.create(
+            subject=subject,
+            message=message
+        )
+        newsletter.send()
+        
+        return redirect('newsletter_success')
+    
+    return render(request, 'classified_ads/newsletter.html')
+# settings.py
+EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'  # Для продакшена
+# EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'  # Для разработки
+
+EMAIL_HOST = 'smtp.gmail.com'  # или ваш SMTP сервер
+EMAIL_PORT = 587
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = 'your_email@gmail.com'
+EMAIL_HOST_PASSWORD = 'your_password'
+DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+# urls.py
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('', views.home, name='home'),
+    path('register/', views.register_request, name='register'),
+    path('verify-code/', views.verify_code, name='verify_code'),
+    path('ad/<int:pk>/', views.ad_detail, name='ad_detail'),
+    path('ad/create/', views.create_advertisement, name='ad_create'),
+    path('ad/<int:pk>/edit/', views.edit_advertisement, name='ad_edit'),
+    path('ad/<int:ad_pk>/response/', views.create_response, name='create_response'),
+    path('my-responses/', views.my_responses, name='my_responses'),
+    path('response/<int:response_pk>/accept/', views.accept_response, name='accept_response'),
+    path('response/<int:response_pk>/delete/', views.delete_response, name='delete_response'),
+    path('newsletter/', views.send_newsletter, name='newsletter'),
+]
